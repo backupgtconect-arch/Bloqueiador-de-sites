@@ -5,55 +5,87 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Extrair domínios</title>
     <style>
-      body{font-family:Arial,Helvetica,sans-serif;max-width:700px;margin:40px auto;padding:0 16px}
-      input,button{font-size:16px}
-      .log{white-space:pre-wrap;margin-top:16px}
+      :root{--bg:#0f172a;--card:#0b1220;--accent:#06b6d4;--muted:#94a3b8;--success:#10b981}
+      html,body{height:100%;margin:0}
+      body{font-family:Inter,Segoe UI,Arial,Helvetica,sans-serif;background:linear-gradient(180deg,#071229 0%, #071a2b 100%);color:#e6eef6;max-width:900px;margin:32px auto;padding:20px}
+      .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:12px;padding:20px;box-shadow:0 6px 18px rgba(2,6,23,0.6);}
+      h1{margin:0 0 12px;font-size:20px}
+      p.lead{margin:0 0 16px;color:var(--muted)}
+      form{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+      input[type=file]{background:transparent;color:inherit;padding:8px;border-radius:8px;border:1px dashed rgba(255,255,255,0.06)}
+      label{color:var(--muted);font-size:13px}
+      button{background:var(--accent);border:none;color:#042027;padding:10px 14px;border-radius:8px;cursor:pointer;font-weight:600}
+      button:disabled{opacity:.6;cursor:default}
+      .progress-wrap{margin-top:14px}
+      .progress{background:rgba(255,255,255,0.04);height:12px;border-radius:999px;overflow:hidden}
+      .progress .bar{height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--success));transition:width 300ms ease}
+      .progress-meta{display:flex;justify-content:space-between;align-items:center;margin-top:8px;color:var(--muted);font-size:13px}
+      .log{white-space:pre-wrap;margin-top:14px;color:#dceafe;background:rgba(255,255,255,0.02);padding:12px;border-radius:8px}
+      .footer{margin-top:12px;color:var(--muted);font-size:13px}
+      @media (max-width:520px){form{flex-direction:column;align-items:stretch}button{width:100%}}
     </style>
   </head>
   <body>
     <h1>Extrair domínios de PDF / XLSX</h1>
-    <form id="uploadForm">
-      <input id="file" type="file" name="file" accept=".pdf,.xls,.xlsx" required />
-      <label style="margin-left:8px"><input id="debug" type="checkbox" /> Debug</label>
-      <label style="margin-left:8px"><input id="ocr" type="checkbox" /> OCR</label>
-      <button type="submit">Enviar e baixar domains.txt</button>
-    </form>
-    <div class="log" id="log"></div>
+    <div class="card">
+      <h1>Extrair domínios de PDF / XLSX</h1>
+      <p class="lead">Envie um arquivo PDF ou planilha; o servidor extrairá e normalizará domínios automaticamente.</p>
+      <form id="uploadForm">
+        <input id="file" type="file" name="file" accept=".pdf,.xls,.xlsx" required />
+        <label><input id="debug" type="checkbox" /> Debug</label>
+        <button id="sendBtn" type="submit">Enviar e baixar domains.txt</button>
+      </form>
+
+      <div class="progress-wrap" id="progressWrap" style="display:none">
+        <div class="progress" aria-hidden="true"><div class="bar" id="progressBar"></div></div>
+        <div class="progress-meta"><span id="progressMsg">Aguardando...</span><span id="progressPct">0%</span></div>
+      </div>
+
+      <div class="log" id="log">Nenhuma ação recente.</div>
+      <div class="footer">
+        Dica: marque <em>Debug</em> para ver respostas JSON em caso de erro.
+        <div style="margin-top:8px;font-size:13px;color:var(--muted)">Criado por AriSimões</div>
+      </div>
+    </div>
 
     <script>
       const form = document.getElementById('uploadForm');
       const fileInput = document.getElementById('file');
       const log = document.getElementById('log');
 
-      const progressBar = document.createElement('progress');
-      progressBar.id = 'progressBar';
-      progressBar.value = 0;
-      progressBar.max = 100;
-      progressBar.style.width = '100%';
-      progressBar.style.display = 'block';
-      form.insertAdjacentElement('afterend', progressBar);
+      const progressWrap = document.getElementById('progressWrap');
+      const progressBar = document.getElementById('progressBar');
+      const progressMsg = document.getElementById('progressMsg');
+      const progressPct = document.getElementById('progressPct');
 
-      const eventSource = new EventSource('/progress');
-      eventSource.onmessage = (event) => {
-        const progress = JSON.parse(event.data);
-        progressBar.value = progress.percent;
-        log.textContent = progress.message;
-
-        if (progress.percent === 100) {
+      let eventSource = null;
+      function startSSE(){
+        if (eventSource) try{ eventSource.close(); }catch(e){}
+        eventSource = new EventSource('/progress');
+        eventSource.onmessage = (event) => {
+          try{
+            const progress = JSON.parse(event.data);
+            progressWrap.style.display = 'block';
+            progressBar.style.width = (progress.percent || 0) + '%';
+            progressMsg.textContent = progress.message || '';
+            progressPct.textContent = (progress.percent || 0) + '%';
+            if ((progress.percent || 0) >= 100) { setTimeout(()=>{ progressWrap.style.display = 'none'; }, 800); eventSource.close(); }
+          }catch(e){ /* ignore parse errors */ }
+        };
+        eventSource.onerror = () => {
+          progressMsg.textContent = 'Erro ao receber atualizações de progresso';
           eventSource.close();
-          progressBar.style.display = 'none';
-        }
-      };
-
-      eventSource.onerror = () => {
-        log.textContent = 'Erro ao receber atualizações de progresso';
-        progressBar.style.display = 'none';
-        eventSource.close();
-      });
+        };
+      }
+      startSSE();
 
       form.addEventListener('submit', async (e) => {
         e.preventDefault();
         if (!fileInput.files.length) return;
+        progressWrap.style.display = 'block'; // Mostra a barra de progresso ao enviar o formulário
+        progressBar.style.width = '0%'; // Reseta o progresso visual
+        progressMsg.textContent = 'Enviando...';
+        progressPct.textContent = '0%';
         const f = fileInput.files[0];
         log.textContent = 'Enviando ' + f.name + ' ...';
         const fd = new FormData();
@@ -61,20 +93,23 @@
         // build query params according to checkboxes
         const params = new URLSearchParams();
         if (document.getElementById('debug').checked) params.set('debug', '1');
-        if (document.getElementById('ocr').checked) params.set('ocr', '1');
         const url = '/upload' + (params.toString() ? ('?' + params.toString()) : '');
+
+        console.log('Enviando requisição para:', url);
 
         try {
           const resp = await fetch(url, { method: 'POST', body: fd });
           if (!resp.ok) {
             const txt = await resp.text();
             log.textContent = 'Erro: ' + txt;
+            progressWrap.style.display = 'none';
             return;
           }
           // if debug mode requested, server returns JSON
           if (document.getElementById('debug').checked) {
             const json = await resp.json();
             log.textContent = JSON.stringify(json, null, 2);
+            progressWrap.style.display = 'none';
             return;
           }
 
@@ -88,8 +123,10 @@
           a.remove();
           URL.revokeObjectURL(dlUrl);
           log.textContent = 'Download iniciado.';
+          progressWrap.style.display = 'none';
         } catch (err) {
           log.textContent = 'Erro: ' + err.message;
+          progressWrap.style.display = 'none';
         }
       });
     </script>

@@ -6,6 +6,7 @@ const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
 const { spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 
 const app = express();
 app.use(cors());
@@ -56,28 +57,83 @@ function extractDomains(urls) {
 }
 
 function commandExists(cmd) {
-  try { const r = spawnSync('command', ['-v', cmd]); return r.status === 0; } catch (e) { return false; }
+  try {
+    const r = spawnSync('which', [cmd]);
+    return r.status === 0;
+  } catch (e) { return false; }
 }
 
-function tryOcrForPdf(filePath, outPrefix) {
+function runCommand(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, Object.assign({ stdio: ['ignore', 'pipe', 'pipe'] }, opts));
+    let stdout = '';
+    let stderr = '';
+    if (child.stdout) child.stdout.on('data', (c) => { stdout += c.toString(); });
+    if (child.stderr) child.stderr.on('data', (c) => { stderr += c.toString(); });
+    child.on('close', (code, signal) => resolve({ status: code === null ? (signal ? 1 : 0) : code, stdout, stderr }));
+    child.on('error', (err) => resolve({ status: 1, stdout: '', stderr: String(err) }));
+  });
+}
+
+function isMeaningfulText(t) {
+  if (!t) return false;
+  const letters = (t.match(/[A-Za-zÀ-ÿ0-9]/g) || []).length;
+  const words = (t.trim().split(/\s+/).filter(Boolean) || []).length;
+  return letters >= 50 && words >= 5;
+}
+
+async function tryOcrForPdf(filePath, outPrefix) {
   const tmpFiles = [];
   try {
-    let imgPath = null;
+    const dir = path.dirname(outPrefix);
+    const base = path.basename(outPrefix);
+    // generate images for all pages
+    let generated = false;
     if (commandExists('pdftoppm')) {
-      const args = ['-f', '1', '-l', '1', '-png', filePath, outPrefix];
-      const r = spawnSync('pdftoppm', args, { encoding: 'utf8', timeout: 30000 });
-      if (r.status === 0) { imgPath = outPrefix + '-1.png'; tmpFiles.push(imgPath); }
+      const args = ['-png', filePath, outPrefix];
+      const r = await runCommand('pdftoppm', args);
+      if (r.status === 0) generated = true; else console.error('pdftoppm failed:', r.status, r.stderr);
     }
-    if (!imgPath && commandExists('convert')) {
-      imgPath = outPrefix + '-1.png';
-      const r = spawnSync('convert', [filePath + '[0]', imgPath], { encoding: 'utf8', timeout: 30000 });
-      if (r.status !== 0) imgPath = null; else tmpFiles.push(imgPath);
+    if (!generated && commandExists('pdftocairo')) {
+      const r = await runCommand('pdftocairo', ['-png', filePath, outPrefix]);
+      if (r.status === 0) generated = true; else console.error('pdftocairo failed:', r.status, r.stderr);
     }
-    if (!imgPath) return { success: false, reason: 'Nenhum conversor de PDF disponível (pdftoppm/convert).' };
+    if (!generated && commandExists('convert')) {
+      // ImageMagick: write pages to numbered PNGs
+      const imgPattern = outPrefix + '-%d.png';
+      const r = await runCommand('convert', [filePath, imgPattern]);
+      if (r.status === 0) generated = true; else console.error('convert failed:', r.status, r.stderr);
+    }
+
+    if (!generated) return { success: false, reason: 'Nenhum conversor de PDF disponível ou falha ao gerar imagens (pdftoppm/pdftocairo/convert).' };
+
+    // collect generated PNGs with matching prefix
+    const matches = fs.readdirSync(dir).filter(f => f.startsWith(base) && f.endsWith('.png'));
+    if (!matches.length) return { success: false, reason: 'Nenhuma imagem gerada pelo conversor para OCR.' };
+
+    // sort by trailing number to preserve page order
+    matches.sort((a, b) => {
+      const na = (a.match(/(\d+)(?=\.png$)/) || [0])[0];
+      const nb = (b.match(/(\d+)(?=\.png$)/) || [0])[0];
+      return parseInt(na || '0', 10) - parseInt(nb || '0', 10);
+    });
+
+    // perform OCR on each image and concatenate (async so SSE can flush)
     if (!commandExists('tesseract')) return { success: false, reason: 'Tesseract não encontrado no sistema.' };
-    const t = spawnSync('tesseract', [imgPath, 'stdout'], { encoding: 'utf8', timeout: 120000 });
-    if (t.status !== 0) return { success: false, reason: 'Tesseract falhou: ' + (t.stderr || '').toString() };
-    return { success: true, text: t.stdout };
+    let combined = '';
+    for (let i = 0; i < matches.length; i++) {
+      const img = path.join(dir, matches[i]);
+      tmpFiles.push(img);
+      try {
+        sendProgressUpdate(40 + Math.floor((i / matches.length) * 50), `OCR página ${i + 1} de ${matches.length}...`);
+        const t = await runCommand('tesseract', [img, 'stdout']);
+        if (t.status === 0 && t.stdout) combined += '\n' + t.stdout; else console.error('tesseract failed for', img, t.status, t.stderr);
+      } catch (err) {
+        console.error('Erro ao rodar tesseract em', img, err && err.message);
+      }
+    }
+    sendProgressUpdate(90, 'OCR de todas as páginas concluído.');
+    return { success: true, text: combined };
   } catch (err) { return { success: false, reason: String(err) }; } finally { for (const f of tmpFiles) { try { fs.unlinkSync(f); } catch (e) {} } }
 }
 
@@ -103,7 +159,11 @@ function sendProgressUpdate(percent, message) {
 }
 
 app.post('/upload', (req, res) => {
+  console.log('Rota /upload foi chamada');
   console.log('[upload] attempt', { time: new Date().toISOString(), ip: req.ip || req.connection.remoteAddress, contentLength: req.headers['content-length'] });
+  console.log('Headers:', req.headers);
+  console.log('Method:', req.method);
+  console.log('Body:', req.body);
   upload.single('file')(req, res, async function (err) {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).send(`Arquivo muito grande. Limite: ${Math.round(MAX_FILE_BYTES / (1024 * 1024))}MB`);
@@ -121,22 +181,34 @@ app.post('/upload', (req, res) => {
       if (ext === '.pdf') {
         const data = await pdf(buffer);
         extractedText = data.text || '';
+        const pageCount = data.numpages || (data.info && data.info.Pages) || 1;
         urls = extractUrlsFromText(extractedText);
-        sendProgressUpdate(30, 'Texto extraído do PDF.');
+        sendProgressUpdate(30, `Texto extraído do PDF (${pageCount} páginas).`);
 
-        if ((urls.length === 0 || req.query.ocr === '1')) {
-          const outPrefix = path.join(__dirname, 'tmp', req.file.filename + '_p');
-          const ocrResult = tryOcrForPdf(req.file.path, outPrefix);
-          if (ocrResult.success && ocrResult.text) {
-            extractedText += '\n' + ocrResult.text;
-            const ocrUrls = extractUrlsFromText(ocrResult.text);
-            urls.push(...ocrUrls);
-            sendProgressUpdate(70, 'OCR concluído.');
-          } else if (req.query.ocr === '1') {
-            sendProgressUpdate(100, 'Erro no OCR.');
-            if (req.query.debug === '1') return res.json({ ok: false, reason: ocrResult.reason || 'OCR failed' });
-          }
-        }
+        // Força OCR automaticamente quando o PDF tiver mais de uma página,
+        // ou quando o texto extraído não for significativo, ou se ?ocr=1 for passado.
+        const needsOcr = req.query.ocr === '1' || pageCount > 1 || !isMeaningfulText(extractedText);
+            if (needsOcr) {
+              sendProgressUpdate(40, 'Detectado PDF sem texto pesquisável — iniciando OCR...');
+              const outPrefix = path.join(__dirname, 'tmp', req.file.filename + '_p');
+              const ocrResult = await tryOcrForPdf(req.file.path, outPrefix);
+              console.log('OCR result:', ocrResult && typeof ocrResult === 'object' ? ocrResult.reason || '(ok)' : ocrResult);
+              if (ocrResult.success && ocrResult.text) {
+                if (ocrResult.text.trim()) {
+                  extractedText += '\n' + ocrResult.text;
+                  const ocrUrls = extractUrlsFromText(ocrResult.text);
+                  urls.push(...ocrUrls);
+                  sendProgressUpdate(70, 'OCR concluído.');
+                } else {
+                  sendProgressUpdate(100, 'OCR executado, mas nenhum texto retornado.');
+                  if (req.query.debug === '1') return res.json({ ok: false, reason: 'OCR retornou texto vazio' });
+                }
+              } else {
+                console.error('OCR falhou:', ocrResult && ocrResult.reason);
+                sendProgressUpdate(100, 'OCR indisponível/falhou. Consulte logs do servidor.');
+                if (req.query.ocr === '1' && req.query.debug === '1') return res.json({ ok: false, reason: ocrResult.reason || 'OCR failed' });
+              }
+            }
       } else if (ext === '.xls' || ext === '.xlsx') {
         sendProgressUpdate(30, 'Processando arquivo Excel...');
         const workbook = XLSX.read(buffer, { type: 'buffer' });
