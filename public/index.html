@@ -25,6 +25,32 @@
       const fileInput = document.getElementById('file');
       const log = document.getElementById('log');
 
+      const progressBar = document.createElement('progress');
+      progressBar.id = 'progressBar';
+      progressBar.value = 0;
+      progressBar.max = 100;
+      progressBar.style.width = '100%';
+      progressBar.style.display = 'block';
+      form.insertAdjacentElement('afterend', progressBar);
+
+      const eventSource = new EventSource('/progress');
+      eventSource.onmessage = (event) => {
+        const progress = JSON.parse(event.data);
+        progressBar.value = progress.percent;
+        log.textContent = progress.message;
+
+        if (progress.percent === 100) {
+          eventSource.close();
+          progressBar.style.display = 'none';
+        }
+      };
+
+      eventSource.onerror = () => {
+        log.textContent = 'Erro ao receber atualizações de progresso';
+        progressBar.style.display = 'none';
+        eventSource.close();
+      });
+
       form.addEventListener('submit', async (e) => {
         e.preventDefault();
         if (!fileInput.files.length) return;

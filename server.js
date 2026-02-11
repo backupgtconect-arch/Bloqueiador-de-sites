@@ -81,8 +81,28 @@ function tryOcrForPdf(filePath, outPrefix) {
   } catch (err) { return { success: false, reason: String(err) }; } finally { for (const f of tmpFiles) { try { fs.unlinkSync(f); } catch (e) {} } }
 }
 
+const clients = [];
+
+app.get('/progress', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  clients.push(res);
+
+  req.on('close', () => {
+    const index = clients.indexOf(res);
+    if (index !== -1) clients.splice(index, 1);
+  });
+});
+
+function sendProgressUpdate(percent, message) {
+  clients.forEach((res) => {
+    res.write(`data: ${JSON.stringify({ percent, message })}\n\n`);
+  });
+}
+
 app.post('/upload', (req, res) => {
-  // log básico para diagnóstico: confirma se o request chega ao Node e seu tamanho
   console.log('[upload] attempt', { time: new Date().toISOString(), ip: req.ip || req.connection.remoteAddress, contentLength: req.headers['content-length'] });
   upload.single('file')(req, res, async function (err) {
     if (err) {
@@ -90,6 +110,9 @@ app.post('/upload', (req, res) => {
       return res.status(400).send('Erro no upload: ' + (err.message || err.toString()));
     }
     if (!req.file) return res.status(400).send('Nenhum arquivo enviado');
+
+    sendProgressUpdate(10, 'Upload concluído. Iniciando processamento...');
+
     const ext = path.extname(req.file.originalname).toLowerCase();
     let urls = [];
     try {
@@ -99,6 +122,8 @@ app.post('/upload', (req, res) => {
         const data = await pdf(buffer);
         extractedText = data.text || '';
         urls = extractUrlsFromText(extractedText);
+        sendProgressUpdate(30, 'Texto extraído do PDF.');
+
         if ((urls.length === 0 || req.query.ocr === '1')) {
           const outPrefix = path.join(__dirname, 'tmp', req.file.filename + '_p');
           const ocrResult = tryOcrForPdf(req.file.path, outPrefix);
@@ -106,11 +131,14 @@ app.post('/upload', (req, res) => {
             extractedText += '\n' + ocrResult.text;
             const ocrUrls = extractUrlsFromText(ocrResult.text);
             urls.push(...ocrUrls);
+            sendProgressUpdate(70, 'OCR concluído.');
           } else if (req.query.ocr === '1') {
+            sendProgressUpdate(100, 'Erro no OCR.');
             if (req.query.debug === '1') return res.json({ ok: false, reason: ocrResult.reason || 'OCR failed' });
           }
         }
       } else if (ext === '.xls' || ext === '.xlsx') {
+        sendProgressUpdate(30, 'Processando arquivo Excel...');
         const workbook = XLSX.read(buffer, { type: 'buffer' });
         for (const sheetName of workbook.SheetNames) {
           const sheet = workbook.Sheets[sheetName];
@@ -132,22 +160,31 @@ app.post('/upload', (req, res) => {
             }
           }
         }
+        sendProgressUpdate(70, 'Processamento do Excel concluído.');
       } else {
+        sendProgressUpdate(100, 'Tipo de arquivo não suportado.');
         return res.status(400).send('Tipo de arquivo não suportado. Envie PDF ou XLS/XLSX.');
       }
+
       const domains = extractDomains(urls);
       const out = domains.join('\n');
-      if (req.query.debug === '1') {
-        return res.json({ file: req.file.originalname, ext, extractedTextPreview: (extractedText || '').slice(0, 2000), urlsFound: urls.slice(0, 500), domains: domains });
-      }
+      sendProgressUpdate(90, 'Extração de domínios concluída.');
+
       res.setHeader('Content-disposition', 'attachment; filename=domains.txt');
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.send(out);
+      sendProgressUpdate(100, 'Processamento concluído.');
     } catch (err) {
       console.error(err);
+      sendProgressUpdate(100, 'Erro ao processar o arquivo.');
       res.status(500).send('Erro ao processar o arquivo');
     } finally {
-      try { fs.unlinkSync(req.file.path); } catch (e) {}
+      try {
+        fs.unlinkSync(req.file.path);
+        sendProgressUpdate(100, 'Limpando arquivos temporários...');
+      } catch (e) {
+        console.error('Erro ao remover arquivos temporários:', e);
+      }
     }
   });
 });
