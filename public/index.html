@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Extrair domínios</title>
+    <style>
+      body{font-family:Arial,Helvetica,sans-serif;max-width:700px;margin:40px auto;padding:0 16px}
+      input,button{font-size:16px}
+      .log{white-space:pre-wrap;margin-top:16px}
+    </style>
+  </head>
+  <body>
+    <h1>Extrair domínios de PDF / XLSX</h1>
+    <form id="uploadForm">
+      <input id="file" type="file" name="file" accept=".pdf,.xls,.xlsx" required />
+      <label style="margin-left:8px"><input id="debug" type="checkbox" /> Debug</label>
+      <label style="margin-left:8px"><input id="ocr" type="checkbox" /> OCR</label>
+      <button type="submit">Enviar e baixar domains.txt</button>
+    </form>
+    <div class="log" id="log"></div>
+
+    <script>
+      const form = document.getElementById('uploadForm');
+      const fileInput = document.getElementById('file');
+      const log = document.getElementById('log');
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        if (!fileInput.files.length) return;
+        const f = fileInput.files[0];
+        log.textContent = 'Enviando ' + f.name + ' ...';
+        const fd = new FormData();
+        fd.append('file', f);
+        // build query params according to checkboxes
+        const params = new URLSearchParams();
+        if (document.getElementById('debug').checked) params.set('debug', '1');
+        if (document.getElementById('ocr').checked) params.set('ocr', '1');
+        const url = '/upload' + (params.toString() ? ('?' + params.toString()) : '');
+
+        try {
+          const resp = await fetch(url, { method: 'POST', body: fd });
+          if (!resp.ok) {
+            const txt = await resp.text();
+            log.textContent = 'Erro: ' + txt;
+            return;
+          }
+          // if debug mode requested, server returns JSON
+          if (document.getElementById('debug').checked) {
+            const json = await resp.json();
+            log.textContent = JSON.stringify(json, null, 2);
+            return;
+          }
+
+          const blob = await resp.blob();
+          const dlUrl = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = dlUrl;
+          a.download = 'domains.txt';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(dlUrl);
+          log.textContent = 'Download iniciado.';
+        } catch (err) {
+          log.textContent = 'Erro: ' + err.message;
+        }
+      });
+    </script>
+  </body>
+</html>
